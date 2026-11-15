@@ -1,49 +1,52 @@
-# Splunk SOC Lab: Detecting a Simulated Intrusion with Sysmon
+# Splunk Home Lab: Catching a Simulated Attack
 
-A home SOC lab built from scratch on a Windows laptop. I generated a benign simulated intrusion, collected the telemetry with **Sysmon** and **Splunk Enterprise**, then investigated it as a Tier 1 SOC analyst would: build the timeline, correlate the evidence, map it to **MITRE ATT&CK**, find where detection failed, remediate, and verify.
+I wanted to find out if I could spot an attack on my own laptop using the same kind of tools a SOC uses. So I installed Sysmon and Splunk on my Windows laptop, ran a harmless script that copies what an attacker might do, and then went looking for it in the logs.
 
-**Tools:** Splunk Enterprise 10.6 · Sysmon · Windows Event Logs · PowerShell · SPL
+This is what I set up, what went wrong, what I found, and the searches I used.
 
----
-
-## Summary of findings
-
-> A PowerShell script was launched with administrator rights and `-ExecutionPolicy Bypass`. It ran a second script staged in the user's **Music** folder through an unusual `powershell → cmd → powershell` chain, connected out to `example.com` over HTTPS, and created a scheduled task (`LabPersistenceDemo`) that runs at every logon. **Sysmon detected every stage. The Windows Security log missed the persistence entirely** because scheduled-task auditing was disabled, a real detection gap.
+**Tools:** Splunk Enterprise 10.6, Sysmon, Windows event logs, PowerShell
 
 ---
 
-## Lab architecture
+## The setup
 
-| Component | Role |
-|---|---|
-| **Sysmon** | Records detailed endpoint activity: process creation, network connections, DNS queries |
-| **Windows Event Logs** | `Security` (logons, privilege use, audit events) and `Windows PowerShell` |
-| **Splunk Enterprise** | SIEM: collects all three logs into a dedicated `lab` index for searching |
-| **`Invoke-LabTelemetry.ps1`** | Benign script that reproduces four attacker behaviours, with a `-Cleanup` switch |
+- **Sysmon** records what happens on the laptop in much more detail than Windows does by default: programs starting, network connections, DNS lookups.
+- **Splunk** collects the logs so I can search them. I sent three logs into an index called `lab`: Sysmon, Security and Windows PowerShell.
+- **The test script** (`Invoke-LabTelemetry.ps1`) does four suspicious things: runs PowerShell with the security check switched off, runs a second script from the Music folder, connects to a website, and creates a scheduled task. It's harmless, it only connects to `example.com`, and it has a `-Cleanup` option to undo everything.
 
-![Ingestion](screenshots/01-ingestion.png)
-*All three log sources ingesting into the `lab` index.*
+![Logs coming into Splunk](screenshots/01-ingestion.png)
 
 ---
 
-## Attack timeline (verified from real logs)
+## First problem: Splunk had no data
 
-| Time | Activity | Evidence | MITRE ATT&CK |
+After adding the inputs, my search came back with nothing. Instead of reinstalling, I checked one thing at a time:
+
+1. `index=*` returned nothing, so the logs weren't going to the wrong index. They weren't arriving at all.
+2. Splunk's own error log (`index=_internal`) had no errors about Windows logs, so Splunk wasn't even trying to collect them.
+3. `splunk btool inputs list WinEventLog --debug` showed no inputs loaded.
+4. Listing `C:\Program Files\Splunk\etc\system\local\` showed there was no `inputs.conf` file. My edit had never been saved in the right place.
+
+I wrote the file with PowerShell instead of Notepad, restarted Splunk, and all three logs started coming in. This took longer than the rest of the lab, but it's the part I learned the most from.
+
+---
+
+## What I found
+
+I ran the script at 15:37:55 and searched the next few seconds of logs.
+
+| Time | What happened | Where I saw it | MITRE ATT&CK |
 |---|---|---|---|
-| 15:37:54 | `powershell.exe -ExecutionPolicy Bypass -File Invoke-LabTelemetry.ps1`, running at **High** integrity (admin) | Sysmon 1 | T1059.001 PowerShell |
-| 15:37:57 | `powershell.exe` → `cmd.exe /c powershell.exe ... -File C:\Users\Windows\Music\lab\stage1.ps1` | Sysmon 1 | T1059.003 Windows Command Shell |
-| 15:37:57 | `cmd.exe` → `powershell.exe -NoProfile -ExecutionPolicy Bypass ...\Music\lab\stage1.ps1` | Sysmon 1 | T1059.001 PowerShell |
-| 15:38:02 | `powershell.exe` → `172.66.147.243:443` | Sysmon 3 | T1071.001 Web Protocols |
-| 15:38:03 | `powershell.exe` DNS query for `example.com`, resolving to `172.66.147.243` | Sysmon 22 | n/a |
-| 15:38:03 | `schtasks.exe /Create /TN LabPersistenceDemo /TR calc.exe /SC ONLOGON /F` | Sysmon 1 | T1053.005 Scheduled Task |
+| 15:37:54 | PowerShell started the script with `-ExecutionPolicy Bypass`, running as admin | Sysmon event 1 | T1059.001 |
+| 15:37:57 | PowerShell started `cmd.exe`, which ran `C:\Users\Windows\Music\lab\stage1.ps1` | Sysmon event 1 | T1059.003 |
+| 15:37:57 | `cmd.exe` started PowerShell again with `-NoProfile -ExecutionPolicy Bypass` | Sysmon event 1 | T1059.001 |
+| 15:38:02 | PowerShell connected to `172.66.147.243` on port 443 | Sysmon event 3 | T1071.001 |
+| 15:38:03 | PowerShell looked up `example.com`, which resolved to that same IP | Sysmon event 22 | |
+| 15:38:03 | `schtasks.exe` created a task called `LabPersistenceDemo` to run at every logon | Sysmon event 1 | T1053.005 |
 
----
+### Which programs ran
 
-## Investigation
-
-### 1. What ran? Process creation (Sysmon Event 1)
-
-The default WinEventLog format stores Sysmon fields inside the `Message` text, so I extracted them with `rex`, then filtered out known-good noise (Splunk's own bundled `postgres.exe`, which spawned `cmd.exe` repeatedly).
+Sysmon puts most of the useful details inside one long `Message` field, so I used `rex` to pull out the parts I needed. Splunk's own `postgres.exe` kept starting `cmd.exe` in the background, so I filtered that out to leave only the activity that mattered.
 
 ```spl
 index=lab EventCode=1 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10"
@@ -55,15 +58,11 @@ index=lab EventCode=1 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10
 | sort _time
 ```
 
-![Process tree](screenshots/02-process-tree.png)
+![The four attack steps](screenshots/02-process-tree.png)
 
-**Why each row is suspicious:**
-- **Location:** a script running from `Music\lab`. User media folders are not where legitimate scripts live.
-- **Red-flag arguments:** `-ExecutionPolicy Bypass`, `-NoProfile`, `/SC ONLOGON`.
-- **Process chain:** `powershell → cmd → powershell` has no legitimate user workflow behind it.
-- **Persistence:** `/TR calc.exe` is the payload the task launches. Here it is a harmless stand-in for malware.
+What gave it away: a script running from the Music folder, the `Bypass` and `-NoProfile` flags, and PowerShell starting cmd starting PowerShell again, which isn't something a normal user does. The scheduled task launches `calc.exe`. In a real attack, that's where the malware would go.
 
-### 2. Did it talk to the internet? Network connection (Sysmon Event 3)
+### The internet connection
 
 ```spl
 index=lab EventCode=3 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10"
@@ -74,11 +73,13 @@ index=lab EventCode=3 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10
 | table _time, Image, IP, Port
 ```
 
-![Network](screenshots/03-network.png)
+![PowerShell connecting out](screenshots/03-network.png)
 
-PowerShell, not a browser, made an outbound HTTPS connection. Port 443 does not make it benign: attackers favour it because it blends in with normal web traffic.
+Port 443 looks like normal web browsing, which is exactly why attackers use it. What stands out here is PowerShell making the connection, not a browser.
 
-### 3. Where was it going? DNS query (Sysmon Event 22), and correlation
+### Where it was going
+
+The network event only had an IP address, so I checked the DNS lookups to get the website name.
 
 ```spl
 index=lab EventCode=22 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10"
@@ -89,78 +90,61 @@ index=lab EventCode=22 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:1
 | table _time, Image, Domain, Answer
 ```
 
-![DNS](screenshots/04-dns.png)
+![DNS lookup for example.com](screenshots/04-dns.png)
 
-The DNS answer contains `172.66.147.243`, the exact IP from the network event. More importantly, the DNS event's **ProcessGuid `{bc3e4e82-8052-...}` matches the process that launched the attack script**. That is hard proof that the same PowerShell instance ran the script and made the connection, rather than an inference from timestamps.
+The answer included `172.66.147.243`, the same IP as the connection. The DNS event also had the same `ProcessGuid` as the PowerShell process that started the script, so I could prove it was the same process the whole way through, not just a guess based on the timing.
 
-![DNS event detail](screenshots/04b-dns-event-detail.png)
+![Matching ProcessGuid](screenshots/04b-dns-event-detail.png)
 
-> `example.com` is a reserved IANA test domain, chosen so nothing harmful was contacted. In a real case the next step would be a reputation check on VirusTotal / AbuseIPDB. The *behaviour* (PowerShell beaconing out mid-attack) is the finding regardless of the destination's reputation.
+`example.com` is a safe test domain. With a real IP, my next step would be checking it on VirusTotal or AbuseIPDB.
 
-### 4. Detection gap: the Security log missed the persistence
+---
 
-Windows logs scheduled-task creation as **Security Event 4698**. It returned **zero results**.
+## The gap: Windows didn't log the scheduled task
+
+Windows is supposed to record new scheduled tasks as Security event 4698. My search for it came back empty.
 
 ```spl
 index=lab EventCode=4698 earliest="11/14/2026:15:37:50" latest="11/14/2026:15:38:10"
 ```
 
-Rather than assume the cause, I proved it on the endpoint:
+To find out why, I checked the audit setting and the task itself on the laptop:
 
 ```powershell
-auditpol /get /subcategory:"Other Object Access Events"   # → No Auditing
-Get-ScheduledTask -TaskName "LabPersistenceDemo"           # → exists, State: Ready
+auditpol /get /subcategory:"Other Object Access Events"   # No Auditing
+Get-ScheduledTask -TaskName "LabPersistenceDemo"           # exists, Ready
 ```
 
-![Detection gap](screenshots/05-detection-gap.png)
+![Audit setting and the task](screenshots/05-detection-gap.png)
 
-**Impact:** an organisation relying on the Security log alone would not have seen this persistence. Only Sysmon caught it.
-**Recommendation:** enable the audit subcategory so Event 4698 is recorded:
+So the task was really there, but Windows wasn't set up to record it. If I'd only been watching the Security log, I would have missed it completely. Sysmon caught it.
+
+The fix is to turn that auditing on:
+
 ```powershell
 auditpol /set /subcategory:"Other Object Access Events" /success:enable
 ```
 
 ---
 
-## Remediation and verification
+## Cleaning up
 
 ```powershell
 .\scripts\Invoke-LabTelemetry.ps1 -Cleanup
-Get-ScheduledTask -TaskName "LabPersistenceDemo"   # → ObjectNotFound = task removed
+Get-ScheduledTask -TaskName "LabPersistenceDemo"   # now returns "not found"
 ```
 
-![Remediation verified](screenshots/06-remediation-verified.png)
+![Task removed](screenshots/06-remediation-verified.png)
 
 ---
 
-## Troubleshooting: when the SIEM showed nothing
+## What I took from it
 
-Setup did not work first time, and the fix is worth recording. After configuring inputs, `index=lab` returned 0 events. I worked down the stack one layer at a time:
+- When a tool shows no data, check each layer before changing anything.
+- Most of the logs were normal background activity. Filtering out what I knew was normal made the attack easy to see.
+- Matching IDs between events is much stronger evidence than lining up timestamps.
+- One log source isn't enough. The Security log missed something Sysmon caught.
 
-| Check | Result | Conclusion |
-|---|---|---|
-| `index=* \| stats count by index, sourcetype` | 0 | No Windows data in *any* index, so not a wrong-index problem |
-| `index=_internal WinEventLog (log_level=ERROR OR log_level=WARN)` | 0 | Splunk wasn't failing to collect. It wasn't trying |
-| `splunk btool inputs list WinEventLog --debug` | empty | No event log inputs loaded at all |
-| `Get-ChildItem ...\Splunk\etc\system\local\` | no `inputs.conf` | **Root cause:** the config file was never saved where Splunk reads it |
+Next I want to turn these searches into Splunk alerts, and try the same lab with the auditing switched on to see event 4698 come through.
 
-**Fix:** wrote `inputs.conf` directly from PowerShell (`Set-Content`) with three stanzas pointing at `index = lab`, restarted Splunk, and confirmed all three sourcetypes were ingesting.
-
-**Lesson:** verify each layer (file exists → config loaded → data arriving) instead of guessing.
-
----
-
-## Skills demonstrated
-
-- SIEM deployment and log onboarding (Splunk `inputs.conf`, indexes, `btool`)
-- Endpoint telemetry with Sysmon (Events 1, 3, 22)
-- SPL: field extraction with `rex`, filtering, `stats`, `table`
-- Process-tree analysis and noise reduction
-- Event correlation using ProcessGuid
-- MITRE ATT&CK mapping
-- Detection-gap analysis with root cause proven on the endpoint
-- Remediation and verification
-
----
-
-*Built by Moses Adegun · CompTIA Security+*
+*Moses Adegun, CompTIA Security+*
